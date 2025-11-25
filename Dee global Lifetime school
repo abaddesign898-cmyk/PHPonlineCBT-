@@ -1,0 +1,251 @@
+<?php
+session_start();
+ini_set('display_errors',1);
+error_reporting(E_ALL);
+
+$dbfile = __DIR__ . '/school.db';
+$init = !file_exists($dbfile);
+$pdo = new PDO('sqlite:' . $dbfile);
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+// Initialize DB
+if($init){
+    $pdo->exec("
+    CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE classes (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    CREATE TABLE exams (id INTEGER PRIMARY KEY AUTOINCREMENT, class_id INTEGER, type TEXT, text TEXT, option_a TEXT, option_b TEXT, option_c TEXT, option_d TEXT, correct_option TEXT, mark_value REAL);
+    CREATE TABLE students (id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT, class_id INTEGER);
+    CREATE TABLE student_answers (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER, exam_id INTEGER, selected_option TEXT, answer_text TEXT, mark_awarded REAL);
+    CREATE TABLE midterm (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER, score REAL);
+    ");
+    $stmt = $pdo->prepare("INSERT INTO settings (k,v) VALUES (?,?)");
+    $stmt->execute(['school_name','Dee Global Life Time College']);
+    $classes = ['JSS1','JSS2','JSS3','SSS1','SSS2','SSS3'];
+    $stmt = $pdo->prepare("INSERT INTO classes (name) VALUES (?)");
+    foreach($classes as $c) $stmt->execute([$c]);
+}
+
+// Helpers
+function h($s){return htmlspecialchars($s ?? '',ENT_QUOTES);}
+function getSetting($k){global $pdo;$s=$pdo->prepare("SELECT v FROM settings WHERE k=?");$s->execute([$k]);return $s->fetchColumn();}
+function nav(){echo "<nav style='padding:10px;background:#f4f4f4;margin-bottom:10px;'><a href='?'>Home</a> | <a href='?action=admin'>Admin</a></nav>";}
+
+// Actions
+$action = $_GET['action'] ?? 'home';
+
+// Add question
+if($action==='add_question' && $_SERVER['REQUEST_METHOD']==='POST'){
+    $stmt=$pdo->prepare("INSERT INTO exams (class_id,type,text,option_a,option_b,option_c,option_d,correct_option,mark_value) VALUES (?,?,?,?,?,?,?,?,?)");
+    $stmt->execute([$_POST['class_id'],$_POST['type'],$_POST['text'],$_POST['option_a'],$_POST['option_b'],$_POST['option_c'],$_POST['option_d'],$_POST['correct_option'],$_POST['mark_value']]);
+    header("Location: ?action=admin"); exit;
+}
+
+// Start exam
+if($action==='start_exam' && $_SERVER['REQUEST_METHOD']==='POST'){
+    $full_name = trim($_POST['full_name']);
+    $class_id = $_POST['class_id'];
+    if(!$full_name){$_SESSION['error']="Full name required"; header("Location: ?"); exit;}
+    $stmt = $pdo->prepare("INSERT INTO students (full_name,class_id) VALUES (?,?)");
+    $stmt->execute([$full_name,$class_id]);
+    $_SESSION['student_id'] = $pdo->lastInsertId();
+    header("Location: ?action=take_exam"); exit;
+}
+
+// Submit exam
+if($action==='submit_exam' && $_SERVER['REQUEST_METHOD']==='POST'){
+    $student_id = $_SESSION['student_id'];
+    foreach($_POST['exam_ids'] as $eid){
+        $stmt = $pdo->prepare("INSERT INTO student_answers (student_id,exam_id,selected_option,answer_text,mark_awarded) VALUES (?,?,?,?,?)");
+        $stmt->execute([
+            $student_id,
+            $eid,
+            $_POST['answer_'.$eid] ?? null,
+            $_POST['text_'.$eid] ?? null,
+            null
+        ]);
+    }
+    header("Location: ?action=admin_mark"); exit;
+}
+
+// Auto mark
+if($action==='auto_mark'){
+    foreach($pdo->query("SELECT sa.id, sa.selected_option, sa.answer_text, e.type, e.correct_option, e.mark_value FROM student_answers sa JOIN exams e ON e.id=sa.exam_id") as $row){
+        $mark = 0;
+        if($row['type']==='mcq'){
+            if(strtoupper($row['selected_option'])===strtoupper($row['correct_option'])) $mark=$row['mark_value'];
+        } else {
+            $mark = $row['mark_value'];
+        }
+        $stmt = $pdo->prepare("UPDATE student_answers SET mark_awarded=? WHERE id=?");
+        $stmt->execute([$mark,$row['id']]);
+    }
+    header("Location: ?action=admin_mark"); exit;
+}
+
+// Save midterm (capped at 40)
+if($action==='save_midterm' && $_SERVER['REQUEST_METHOD']==='POST'){
+    $midterm_score = min(max($_POST['score'],0),40); // cap 0-40
+    $stmt = $pdo->prepare("INSERT INTO midterm (student_id,score) VALUES (?,?)");
+    $stmt->execute([$_POST['student_id'],$midterm_score]);
+    header("Location: ?action=admin_mark"); exit;
+}
+
+// Views
+$school_name = getSetting('school_name');
+?><!doctype html>
+<html><head><meta charset="utf-8"><title><?=h($school_name)?></title>
+<style>
+body{font-family:Arial;margin:15px;} 
+input,select,textarea{padding:5px;margin:4px 0;width:100%;} 
+.card{border:1px solid #ddd;padding:10px;border-radius:5px;margin-bottom:10px;} 
+table{width:100%;border-collapse:collapse;} 
+th,td{border:1px solid #ddd;padding:5px;text-align:left;} 
+.btn{padding:6px 12px;background:#0b6;color:white;border:none;border-radius:5px;text-decoration:none;} 
+.printarea{font-size:12px;}
+.radio-label{display:block;padding:2px 0;}
+.radio-label input{margin-right:5px;}
+.radio-selected{background:#e0ffe0;}
+
+/* Print optimization */
+@media print {
+    body{font-size:10px; margin:5mm;}
+    .card{border:none; padding:2mm; margin-bottom:2mm;}
+    table, th, td{border:1px solid #000; padding:2px; font-size:10px;}
+    textarea{border:none; padding:0; margin:0; width:100%; font-size:10px; overflow:hidden; height:auto;}
+    .btn, nav{display:none;}
+    h2,h3,h4{font-size:12px; margin:2px 0;}
+    .question{margin:1mm 0;}
+    .radio-label{display:inline-block; margin-right:5px;}
+    .radio-selected{background:#e0ffe0 !important;}
+}
+</style>
+<script>
+function highlightRadio(name){
+    const labels = document.querySelectorAll('[data-radio="'+name+'"]');
+    labels.forEach(l=>l.classList.remove('radio-selected'));
+    const checked = document.querySelector('input[name="'+name+'"]:checked');
+    if(checked) checked.parentNode.classList.add('radio-selected');
+}
+</script>
+</head><body>
+<h2><?=h($school_name)?> — Exam Portal</h2>
+<?php nav(); ?>
+
+<?php if($action==='home'): ?>
+<div class="card">
+<h3>Student Login</h3>
+<?php if(isset($_SESSION['error'])){echo "<div style='color:red;'>".$_SESSION['error']."</div>"; unset($_SESSION['error']);} ?>
+<form method="post" action="?action=start_exam">
+<label>Full Name (Surname + First name)<input name="full_name" required></label>
+<label>Class<select name="class_id"><?php foreach($pdo->query("SELECT * FROM classes") as $c) echo "<option value='{$c['id']}'>".h($c['name'])."</option>";?></select></label>
+<button class="btn">Start Exam</button>
+</form>
+</div>
+
+<?php elseif($action==='take_exam'): 
+$student_id = $_SESSION['student_id'];
+$class_id = $pdo->prepare("SELECT class_id FROM students WHERE id=?");
+$class_id->execute([$student_id]); $class_id = $class_id->fetchColumn();
+$questions = $pdo->prepare("SELECT * FROM exams WHERE class_id=? ORDER BY RANDOM()");
+$questions->execute([$class_id]); $qs=$questions->fetchAll(PDO::FETCH_ASSOC);
+
+// Shuffle MCQ options per student
+foreach($qs as &$q){
+    if($q['type']==='mcq'){
+        $opts=[]; foreach(['A','B','C','D'] as $o){ if($q['option_'.$o]) $opts[$o]=$q['option_'.$o]; }
+        $keys = array_keys($opts); shuffle($keys);
+        $shuffled=[]; foreach(['A','B','C','D'] as $new_key){
+            $old_key = array_shift($keys);
+            $shuffled[$new_key] = $opts[$old_key] ?? '';
+            if($old_key == strtoupper($q['correct_option'])) $q['correct_option']=$new_key;
+        }
+        $q['option_A']=$shuffled['A'] ?? ''; $q['option_B']=$shuffled['B'] ?? '';
+        $q['option_C']=$shuffled['C'] ?? ''; $q['option_D']=$shuffled['D'] ?? '';
+    }
+}
+unset($q);
+?>
+<div class="card">
+<h3>Exam Questions</h3>
+<form method="post" action="?action=submit_exam">
+<?php foreach($qs as $q): ?>
+<div class="question" style="margin:5px 0;padding:5px;border:1px dashed #ccc;">
+<strong><?=h($q['text'])?> (<?=h($q['mark_value'])?>)</strong><br>
+<?php if($q['type']==='mcq'): ?>
+<?php foreach(['A','B','C','D'] as $opt): if(!$q['option_'.$opt]) continue; ?>
+<label class="radio-label" data-radio="answer_<?=$q['id']?>"><input type="radio" name="answer_<?=$q['id']?>" value="<?=$opt?>" onclick="highlightRadio('answer_<?=$q['id']?>')"> (<?=$opt?>) <?=h($q['option_'.$opt])?></label>
+<?php endforeach; ?>
+<?php else: ?>
+<textarea name="text_<?=$q['id']?>" rows="4" placeholder="Type your answer here..."></textarea>
+<?php endif; ?>
+<input type="hidden" name="exam_ids[]" value="<?=$q['id']?>">
+</div>
+<?php endforeach; ?>
+<button class="btn">Submit Answers</button>
+</form>
+</div>
+
+<?php elseif($action==='admin'): ?>
+<div class="card">
+<h3>Admin — Add Question</h3>
+<form method="post" action="?action=add_question">
+<label>Class<select name="class_id"><?php foreach($pdo->query("SELECT * FROM classes") as $c) echo "<option value='{$c['id']}'>".h($c['name'])."</option>";?></select></label>
+<label>Type<select name="type"><option value="mcq">MCQ</option><option value="theory">Theory</option></select></label>
+<label>Question Text<textarea name="text" required></textarea></label>
+<label>Option A<input name="option_a"></label>
+<label>Option B<input name="option_b"></label>
+<label>Option C<input name="option_c"></label>
+<label>Option D<input name="option_d"></label>
+<label>Correct Option<input name="correct_option"></label>
+<label>Mark<input type="number" name="mark_value" step="0.1" value="1"></label>
+<button class="btn">Add Question</button>
+</form>
+
+<h3>Auto Mark Exams</h3>
+<a href="?action=auto_mark" class="btn">Auto Mark All Exams</a>
+
+<h3>Enter Midterm Score</h3>
+<form method="post" action="?action=save_midterm">
+<label>Student<select name="student_id"><?php foreach($pdo->query("SELECT * FROM students") as $s) echo "<option value='{$s['id']}'>".h($s['full_name'])."</option>";?></select></label>
+<label>Midterm Score (out of 40)<input name="score" type="number" max="40" min="0" required></label>
+<button class="btn">Save Midterm</button>
+</form>
+
+<h3>Print Exam Reports</h3>
+<?php foreach($pdo->query("SELECT * FROM students") as $s): 
+$answers = $pdo->prepare("SELECT sa.*, e.text qtext, e.type, e.correct_option, e.mark_value FROM student_answers sa JOIN exams e ON e.id=sa.exam_id WHERE sa.student_id=?");
+$answers->execute([$s['id']]); $ans=$answers->fetchAll(PDO::FETCH_ASSOC);
+$mid = $pdo->prepare("SELECT score FROM midterm WHERE student_id=?"); $mid->execute([$s['id']]); $midscore = $mid->fetchColumn()?:0;
+
+// Exam score out of 60
+$total_exam=array_sum(array_column($ans,'mark_awarded')); // exam total
+$midscore = min($midscore,40); // midterm capped at 40
+$total = $total_exam + $midscore;
+if($total > 100) $total = 100; // total capped at 100
+?>
+<div class="card printarea">
+<h4><?=h($s['full_name'])?></h4>
+<p><strong>Exam Score:</strong> <?=h($total_exam)?> / 60</p>
+<p><strong>Midterm Score:</strong> <?=h($midscore)?> / 40</p>
+<p><strong>Total Score:</strong> <?=h($total)?> / 100</p>
+
+<table>
+<tr><th>#</th><th>Question</th><th>Answer</th><th>Mark</th></tr>
+<?php foreach($ans as $k=>$a): 
+$symbol = ($a['type']==='mcq' && strtoupper($a['selected_option'])===strtoupper($a['correct_option'])) || $a['type']==='theory' ? '✅' : '❌';
+?>
+<tr>
+<td><?=($k+1)?></td>
+<td><?=h($a['qtext'])?></td>
+<td><?=h($a['selected_option']?:$a['answer_text'])." $symbol"?></td>
+<td><?=h($a['mark_awarded'])?></td>
+</tr>
+<?php endforeach; ?>
+</table>
+
+<button onclick="window.print()" class="btn">Print</button>
+</div>
+<?php endforeach; ?>
+</div>
+<?php endif; ?>
+</body></html>
